@@ -5,57 +5,49 @@ Created on Thu Dec  5 21:56:51 2024
 
 @author: dangkhoa
 """
-import torch
 import cv2
 import numpy as np
-from ultralytics import YOLO
-import supervision as sv
-import mediapipe as mp
+import requests
+import base64
+import os
 
-# Initialize MediaPipe Face Mesh
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False,
-                                  max_num_faces=1,
-                                  refine_landmarks=True,
-                                  min_detection_confidence=0.5,
-                                  min_tracking_confidence=0.5)
-# Define 3D model points of key facial landmarks
-model_points = np.array([
-    [0.0, 0.0, 0.0],         # Nose tip
-    [0.0, -330.0, -65.0],    # Chin
-    [-225.0, 170.0, -135.0], # Left eye left corner
-    [225.0, 170.0, -135.0],  # Right eye right corner
-    [-150.0, -150.0, -125.0],# Left mouth corner
-    [150.0, -150.0, -125.0]  # Right mouth corner
-], dtype=np.float64)
+CLOUD_GPU_ENDPOINT = os.getenv("CLOUD_GPU_ENDPOINT", "http://localhost:8000/infer")
+REQUEST_TIMEOUT_SEC = float(os.getenv("CLOUD_GPU_TIMEOUT", "5"))
 
-landmark_indices = [1, 152, 33, 263, 61, 291]  # corresponding to the model points
-# Detect GPU availability
-if torch.cuda.is_available():
-    if torch.cuda.get_device_name().startswith('NVIDIA'):
-        device = torch.device('cuda')
-        print("Using NVIDIA GPU with CUDA")
-    elif torch.cuda.get_device_name().startswith('gfx'):
-        device = torch.device('cuda')
-        print("Using AMD GPU with ROCm")
-    else:
-        device = torch.device('cpu')
-        print("CUDA device detected but not supported, using CPU")
-elif torch.backends.mps.is_available():
-    device = torch.device('mps')
-    print("Using Apple GPU with Metal Performance Shaders (MPS)")
-else:
-    device = torch.device('cpu')
-    print("No GPU available, using CPU")
 
-# Load the YOLOv8 segmentation seg_seg_model
-byte_tracker = sv.ByteTrack()
-byte_tracker.reset()
-seg_model_name = 'yolo11l-seg'
-seg_model = YOLO(f'{seg_model_name}.pt')
-#seg_model.export(format="coreml")
-#seg_model = YOLO(f'{seg_model_name}.mlpackage')
-seg_model.to(device)  # Move the seg_model to GPU if available
+def request_human_mask(frame):
+    """
+    Send the frame to the cloud GPU endpoint and return a mask pair.
+
+    Expected response payload format (JSON):
+    {
+      "mask": [[0..255, ...], ...],
+      "mask_inv": [[0..255, ...], ...]  # same HxW as input frame
+    }
+    """
+    success, encoded = cv2.imencode(".jpg", frame)
+    if not success:
+        raise RuntimeError("Failed to encode frame before HTTP inference request")
+
+    payload = {"image": base64.b64encode(encoded).decode("utf-8")}
+    response = requests.post(CLOUD_GPU_ENDPOINT, json=payload, timeout=REQUEST_TIMEOUT_SEC)
+    response.raise_for_status()
+
+    data = response.json()
+    container = data.get("data") if isinstance(data.get("data"), dict) else data
+
+    mask_data = container.get("mask")
+    mask_inv_data = container.get("mask_inv")
+    if mask_data is None or mask_inv_data is None:
+        raise ValueError("Inference response must include 'mask' and 'mask_inv' fields")
+
+    mask = np.asarray(mask_data, dtype=np.uint8)
+    mask_inv = np.asarray(mask_inv_data, dtype=np.uint8)
+    if mask.shape != frame.shape[:2] or mask_inv.shape != frame.shape[:2]:
+        raise ValueError(
+            f"Mask shape mismatch. Expected {frame.shape[:2]}, got {mask.shape} and {mask_inv.shape}"
+        )
+    return mask, mask_inv
 cap = cv2.VideoCapture(0)
 #cap = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
 if not cap.isOpened():
@@ -80,59 +72,6 @@ sizes = snowflake_size + np.random.randint(-3, 1, size=num_snowflakes,dtype = dt
 
 # Combine into a single array
 snowflakes = np.column_stack((x_coords, y_coords, sizes))
-def detect_smile(face_landmarks, frame_width, frame_height, wide_ratio=1.1, parted_ratio=0.25):
-    """
-    Returns True if a smile is detected, False otherwise.
-    We measure:
-      - mouth vs. eye distance (mouth_eye_ratio)
-      - parted lips ratio
-    :param face_landmarks: MediaPipe face landmarks
-    :param frame_width, frame_height: Dimensions of the cropped region
-    :param wide_ratio: threshold for mouth-eye ratio
-    :param parted_ratio: threshold for parted lips ratio
-    """
-    # Indices
-    idx_left_mouth = 61
-    idx_right_mouth = 291
-    idx_left_eye = 33
-    idx_right_eye = 263
-    idx_upper_lip = 13
-    idx_lower_lip = 14
-
-    lm = face_landmarks.landmark
-
-    def px(idx):
-        x = int(lm[idx].x * frame_width)
-        y = int(lm[idx].y * frame_height)
-        return x, y
-
-    # Mouth corners
-    lx_m, ly_m = px(idx_left_mouth)
-    rx_m, ry_m = px(idx_right_mouth)
-
-    # Eye corners
-    lx_e, ly_e = px(idx_left_eye)
-    rx_e, ry_e = px(idx_right_eye)
-
-    # Lip vertical
-    ux, uy = px(idx_upper_lip)
-    bx, by = px(idx_lower_lip)
-
-    mouth_width = np.linalg.norm([rx_m - lx_m, ry_m - ly_m])
-    eye_width = np.linalg.norm([rx_e - lx_e, ry_e - ly_e]) + 1e-6  # avoid zero
-    parted_lips = np.linalg.norm([by - uy])  # vertical gap 13..14
-
-    # Ratios
-    mouth_eye_ratio = mouth_width / eye_width
-    lips_eye_ratio = parted_lips / eye_width
-
-    is_big_smile = mouth_eye_ratio > wide_ratio  # corners of mouth widen
-    is_open_lips = lips_eye_ratio > parted_ratio # lips parted significantly
-
-    # Combine
-    is_smiling = is_big_smile or is_open_lips
-    return is_smiling
-
 
 def draw_snowflakes(frame, snowflakes, snowflake_size, snowflake_speed):
     global drift_speed, limit, width, height, min_speed
@@ -249,151 +188,19 @@ def sprite_overlay(background, sprite, x, y):
     background = overlay_transparent(background, sprite_frame, x, y)
     cur_sprite = (cur_sprite + 1) % num_sprite
     return background
-mask = np.zeros(frame.shape[:2], dtype = np.uint8)
+mask = np.zeros(frame.shape[:2], dtype=np.uint8)
 frame1 = np.zeros(frame.shape,dtype = frame.dtype)
-yellow = np.full_like(frame, (0, 255, 255)) 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
-    
-    landmark_indices = [1, 152, 33, 263, 61, 291]
-    model_points = np.array([
-        [0.0, 0.0, 0.0],         # Nose tip
-        [0.0, -330.0, -65.0],    # Chin
-        [-225.0, 170.0, -135.0], # Left eye left corner
-        [225.0, 170.0, -135.0],  # Right eye right corner
-        [-150.0, -150.0, -125.0],# Left mouth corner
-        [150.0, -150.0, -125.0]  # Right mouth corner
-    ], dtype=np.float64)
-    # Optionally resize the frame for performance
-    # frame = cv2.resize(frame, (640, 480))
-    #frame = cv2.flip(frame, 1)
-    # MediaPipe head pose tracking
-    #rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    #results = face_mesh.process(rgb_frame)
 
-    #if results.multi_face_landmarks:
-    #    landmarks = results.multi_face_landmarks[0]
-    #    landmark_indices = [1, 152, 33, 263, 61, 291]
-    #    model_points = np.array([
-    #        [0.0, 0.0, 0.0],         # Nose tip
-    #        [0.0, -330.0, -65.0],    # Chin
-    #        [-225.0, 170.0, -135.0], # Left eye left corner
-    #        [225.0, 170.0, -135.0],  # Right eye right corner
-    #        [-150.0, -150.0, -125.0],# Left mouth corner
-    #        [150.0, -150.0, -125.0]  # Right mouth corner
-    #    ], dtype=np.float64)
-  
-        #image_points = []
-        
-        # for idx in landmark_indices:
-        #     lm = landmarks.landmark[idx]
-        #     x, y = int(lm.x * width), int(lm.y * height)
-        #     image_points.append([x, y])
-        # image_points = np.array(image_points, dtype=np.float64)
-
-        # focal_length = width
-        # center = (width / 2, height / 2)
-        # camera_matrix = np.array([
-        #     [focal_length, 0, center[0]],
-        #     [0, focal_length, center[1]],
-        #     [0, 0, 1]
-        #     ], dtype=np.float64)
-        # dist_coeffs = np.zeros((4, 1))
-
-        # success, rot_vec, trans_vec = cv2.solvePnP(
-        # model_points, image_points, camera_matrix, dist_coeffs)
-
-        # if success:
-        #     rot_mat, _ = cv2.Rodrigues(rot_vec)
-        #     pose_mat = np.hstack((rot_mat, trans_vec))
-        #     _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(pose_mat)
-        #     yaw, pitch, roll = euler_angles.flatten()
-        #     print(f"[Head Pose] Yaw: {yaw:.2f}°, Pitch: {pitch:.2f}°, Roll: {roll:.2f}°")
-
-    # Run YOLOv8 segmentation seg_model on the frame
-    results = seg_model(frame)
-    boxes = results[0].boxes  # Accessing the boxes from results
-    masks = results[0].masks  # Accessing the masks from results
-
-    is_smiling = False
-    if boxes is not None:
-        # Extract detection attributes
-        # class_ids = boxes.cls.cpu().numpy().astype(int)
-        # scores = boxes.conf.cpu().numpy()
-        # xyxys = boxes.xyxy.cpu().numpy()
-        class_ids = boxes.cls
-        scores = boxes.conf
-        xyxys = boxes.xyxy
-        # Filter detections based on confidence score
-        confidence_threshold = 0.7
-        valid_indices = scores > confidence_threshold  # Boolean mask for valid detections
-
-        # Apply the confidence filter
-        filtered_class_ids = class_ids[valid_indices].to(torch.int16)
-        filtered_scores = scores[valid_indices]
-        filtered_xyxys = xyxys[valid_indices]
-
-        # Create filtered detections
-        detections = sv.Detections(
-            xyxy=filtered_xyxys.cpu().numpy(),
-            confidence=filtered_scores.cpu().numpy(),
-            class_id=filtered_class_ids.cpu().numpy()
-        )
-
-        # Update tracker with filtered detections
-        tracked_detections = byte_tracker.update_with_detections(detections)
-        for box in boxes:
-            if int(box.cls) != 0:
-                continue  # Skip non-person detections
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            person_crop = frame[y1:y2, x1:x2]
-            rgb_frame = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
-            face_results = face_mesh.process(rgb_frame)
-
-            if face_results.multi_face_landmarks:
-                for face_landmarks in face_results.multi_face_landmarks:
-                    # Use improved detect_smile function
-                    e = detect_smile(
-                        face_landmarks,
-                        frame_width=(x2 - x1),
-                        frame_height=(y2 - y1)
-                    )
-                    if(e):
-                        is_smiling = True
-                        print("Smiling")
-    else:
-        tracked_detections = []
-
-    # Create an empty mask the size of the frame
-    #mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    loc = []
-    if masks is not None:
-        masks_data = masks.data.cpu().numpy()
-        for track in tracked_detections:
-            track_id = track[4]  # tracker_id is the fifth element
-            bbox = track[0].astype(int)
-            x, y, w, h = bbox
-            
-            for mask_array, class_id, score in zip(masks_data, class_ids, scores):
-                if score > 0.55 and class_id == 0:  # Assuming class ID 0 corresponds to 'person'
-                    # Resize mask to match frame size if necessary
-                    mask_resized = cv2.resize(mask_array, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-                    mask_resized = (mask_resized > 0.5).astype(np.uint8)  # Threshold mask
-                    if(mask_resized[y:h, x:w].any()):
-                        # Combine masks
-                        mask = cv2.bitwise_or(mask, mask_resized * 255)
-                        # Draw the tracking ID text on top of an invisible box
-                        text = 'Merry Christmas'
-                        loc.append((x,y,text))
-        
-    else:
-        print("Segmentation masks not available in the seg_model output.")
+    try:
+        mask, mask_inv = request_human_mask(frame)
+    except Exception as exc:
+        print(f"Segmentation request failed: {exc}")
+        mask.fill(0)
         continue
-
-    # Create an inverse mask for the background
-    mask_inv = cv2.bitwise_not(mask)
 
     # Apply a Gaussian blur to the entire frame
     np.copyto(frame1, frame)
@@ -404,13 +211,11 @@ while True:
     background = cv2.bitwise_and(blurred_frame, blurred_frame, mask=mask_inv)
     mask.fill(0)
     frame = cv2.addWeighted(foreground, 1, background, 1, 0)
-    for x,y,text in loc:
-        cv2.putText(frame, text, (x, y - 10), cv2.FONT_HERSHEY_TRIPLEX, 1, (0, 0, 255), 2)
     x, y = width - overlay.shape[1], height - overlay.shape[0]   # Bottom-right corner
     frame = overlay_transparent(frame, overlay, x, y)
     frame = sprite_overlay(frame, candle, 0 + 50,  height - 200)
     # Display the output
-    cv2.imshow('Webcam Background Blur and Snow with YOLOv8 Segmentation', frame)
+    cv2.imshow('Webcam Background Blur and Snow', frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
