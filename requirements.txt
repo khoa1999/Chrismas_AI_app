@@ -84,5 +84,3 @@ ultralytics-thop==2.0.12
 urllib3==2.2.3
 vertexai==1.71.1
 os
-requests
-numpy
